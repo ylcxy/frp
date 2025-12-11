@@ -19,13 +19,15 @@ import (
 	"net"
 	"sync"
 
-	"github.com/fatedier/frp/pkg/config"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
+	plugin "github.com/fatedier/frp/pkg/plugin/visitor"
 	"github.com/fatedier/frp/pkg/transport"
-	utilnet "github.com/fatedier/frp/pkg/util/net"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 	"github.com/fatedier/frp/pkg/util/xlog"
+	"github.com/fatedier/frp/pkg/vnet"
 )
 
-// Helper wrapps some functions for visitor to use.
+// Helper wraps some functions for visitor to use.
 type Helper interface {
 	// ConnectServer directly connects to the frp server.
 	ConnectServer() (net.Conn, error)
@@ -34,6 +36,8 @@ type Helper interface {
 	// MsgTransporter returns the message transporter that is used to send and receive messages
 	// to the frp server through the controller.
 	MsgTransporter() transport.MessageTransporter
+	// VNetController returns the vnet controller that is used to manage the virtual network.
+	VNetController() *vnet.Controller
 	// RunID returns the run id of current controller.
 	RunID() string
 }
@@ -47,44 +51,65 @@ type Visitor interface {
 
 func NewVisitor(
 	ctx context.Context,
-	cfg config.VisitorConf,
-	clientCfg config.ClientCommonConf,
+	cfg v1.VisitorConfigurer,
+	clientCfg *v1.ClientCommonConfig,
 	helper Helper,
-) (visitor Visitor) {
-	xl := xlog.FromContextSafe(ctx).Spawn().AppendPrefix(cfg.GetBaseConfig().ProxyName)
+) (Visitor, error) {
+	xl := xlog.FromContextSafe(ctx).Spawn().AppendPrefix(cfg.GetBaseConfig().Name)
+	ctx = xlog.NewContext(ctx, xl)
+	var visitor Visitor
 	baseVisitor := BaseVisitor{
 		clientCfg:  clientCfg,
 		helper:     helper,
-		ctx:        xlog.NewContext(ctx, xl),
-		internalLn: utilnet.NewInternalListener(),
+		ctx:        ctx,
+		internalLn: netpkg.NewInternalListener(),
+	}
+	if cfg.GetBaseConfig().Plugin.Type != "" {
+		p, err := plugin.Create(
+			cfg.GetBaseConfig().Plugin.Type,
+			plugin.PluginContext{
+				Name:           cfg.GetBaseConfig().Name,
+				Ctx:            ctx,
+				VnetController: helper.VNetController(),
+				HandleConn: func(conn net.Conn) {
+					_ = baseVisitor.AcceptConn(conn)
+				},
+			},
+			cfg.GetBaseConfig().Plugin.VisitorPluginOptions,
+		)
+		if err != nil {
+			return nil, err
+		}
+		baseVisitor.plugin = p
 	}
 	switch cfg := cfg.(type) {
-	case *config.STCPVisitorConf:
+	case *v1.STCPVisitorConfig:
 		visitor = &STCPVisitor{
 			BaseVisitor: &baseVisitor,
 			cfg:         cfg,
 		}
-	case *config.XTCPVisitorConf:
+	case *v1.XTCPVisitorConfig:
 		visitor = &XTCPVisitor{
 			BaseVisitor:   &baseVisitor,
 			cfg:           cfg,
 			startTunnelCh: make(chan struct{}),
 		}
-	case *config.SUDPVisitorConf:
+	case *v1.SUDPVisitorConfig:
 		visitor = &SUDPVisitor{
 			BaseVisitor:  &baseVisitor,
 			cfg:          cfg,
 			checkCloseCh: make(chan struct{}),
 		}
 	}
-	return
+	return visitor, nil
 }
 
 type BaseVisitor struct {
-	clientCfg  config.ClientCommonConf
+	clientCfg  *v1.ClientCommonConfig
 	helper     Helper
 	l          net.Listener
-	internalLn *utilnet.InternalListener
+	internalLn *netpkg.InternalListener
+	plugin     plugin.Plugin
 
 	mu  sync.RWMutex
 	ctx context.Context
@@ -100,5 +125,8 @@ func (v *BaseVisitor) Close() {
 	}
 	if v.internalLn != nil {
 		v.internalLn.Close()
+	}
+	if v.plugin != nil {
+		v.plugin.Close()
 	}
 }
